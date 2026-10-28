@@ -1,0 +1,66 @@
+#Before the experiment
+
+import os
+import glob
+import pydicom
+import numpy as np
+from psychopy import visual
+from psychopy import core
+from psychopy.event import Mouse
+
+#Begin routine
+
+folder = r'C:\Users\andys\Downloads\testing123DICOM\lidc_idri\lidc_idri'
+flash_time = 0.02
+
+def sort_key(fp): #this function returns the dicom files in sorted order
+    h = pydicom.dcmread(fp, stop_before_pixels=True)   # stop_before_pixels only reads the header so its a bit more faster
+    return (
+        #str(h.get('PatientID', '')),
+        #str(h.get('SeriesInstanceUID', '')),   # groups slices of the same scan together
+        float(h.ImagePositionPatient[2]) if 'ImagePositionPatient' in h
+            else float(h.get('InstanceNumber', 0)) 
+    )
+
+#allows us to gather all of the dicom files within the folder
+files = glob.glob(os.path.join(folder, '**', '*.dcm'), recursive=True)
+files = sorted(files, key=sort_key)
+print(f"found a total of {len(files)} files")
+
+mouse = Mouse()
+mouse.setVisible(1)
+
+for i, filepath in enumerate(files):
+    print(mouse.getPressed(True))
+    mouse.clickReset()
+    ds = pydicom.dcmread(filepath)
+    #converts dicom file into 2d pixel array
+    raw_pixels = ds.pixel_array
+
+    #Data processing that allows us to convert the pixels to a (0, 1) range/scale(black and white)
+    pixel_min = np.min(raw_pixels)
+    pixel_max = np.max(raw_pixels)
+    #this should try and be improved, however this should also try and implement user input to change brightness
+    normalized_pixels = (raw_pixels - pixel_min) / (pixel_max - pixel_min)
+
+    #Convert to PsychoPy's -1 to 1 color space so we can properly view the black and white image
+    psychopy_pixels = np.flipud((normalized_pixels * 2) - 1)
+
+    # This is a test to display some metadata about the image
+    info_text = (
+        f"Image #: {i} / {len(files)}"
+        f"Modality: {ds.get('Modality', 'N/A')}\n"
+        f"Size: {ds.Rows} x {ds.Columns}\n"
+        f"Pixel spacing: {ds.get('PixelSpacing', 'N/A')} mm\n"
+        f"Bits stored: {ds.get('BitsStored', 'N/A')}\n"
+        f"Window C/W: {ds.get('WindowCenter', 'N/A')} / {ds.get('WindowWidth', 'N/A')}"
+    )
+    # updates the existing imaage and text, then stalls for a certain amount of time
+    dicom_display.image = psychopy_pixels
+    displayInfo.text = info_text
+    dicom_display.draw()
+    displayInfo.draw()
+    win.flip()
+    core.wait(flash_time)
+
+core.quit()
