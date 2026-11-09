@@ -214,7 +214,7 @@ def setupWindow(expInfo=None, win=None):
         win = visual.Window(
             size=_winSize, fullscr=_fullScr, screen=0,
             winType='pyglet', allowGUI=False, allowStencil=False,
-            monitor='testMonitor', color=[0,0,0], colorSpace='rgb',
+            monitor='testMonitor', color=[-1,-1,-1], colorSpace='rgb',
             backgroundImage='', backgroundFit='none',
             blendMode='avg', useFBO=True,
             units='height',
@@ -451,7 +451,7 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
     continueRoutine = True
     # update component parameters for each repeat
     # Run 'Begin Routine' code from code
-    folder = r'C:\Users\andys\Downloads\testing123DICOM\lidc_idri\lidc_idri'
+    folder = r'C:\Users\Public\Downloads\lidc_idri\LIDC-IDRI-0001'
     
 
     
@@ -683,7 +683,7 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
                 apply_window()
 
         dx, dy = mouse.getRel()
-        pressed = mouse.getPressed()[0]
+        pressed = mouse.getPressed()[2]
 
         if pressed and not mouse_was_down:          # a new click just started
             hit = button_at(mouse)
