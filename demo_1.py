@@ -13,8 +13,9 @@ If you publish work using this script the most relevant publication is:
 
 """
 Author: Andy Sosa
+Contact: andysosa2007@gmail.com
 Date: 11/9/2026
-Version 1.4
+Version 1.5
 Description: This script was created for the HFAN Research Laboratory. It currently allows the user to see dicom files,
 change the anatomical plane, zoom, window position, and window/level of the filer. The next version will allow ther user to properly guess,
 where they believe the nodule is located.
@@ -464,14 +465,24 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
     # update component parameters for each repeat
     # Run 'Begin Routine' code from code
     
+
+    #-------------------------------------------------------------------------------
+    # RANDOM PATIENT SELECTOR AND DICOM VALIDATOR
+    #-------------------------------------------------------------------------------
+    
+    #File Directory to where the dataset is located. It is very important to ensure root_dir ir set to the proper folder destination in order to run the program
+    # This script has only been tested with the LIDC Cancer and Imaging dataset for CT Scans
+    
     root_dir = r'C:\Users\Public\Downloads\lidc_idri'
+    #gathers all valid patient directories and filters out unecessary folders/files
     patient_dirs = [
         os.path.join(root_dir, d) for d in os.listdir(root_dir)
         if os.path.isdir(os.path.join(root_dir, d)) and d.startswith('LIDC-IDRI-')
     ]
     if not patient_dirs:
         raise FileNotFoundError(f"No LIDC-IDRI patient folders found in {root_dir}")
-
+    
+    #shuffles all the collected folders using numpy
     shuffled_dirs = list(patient_dirs)
     np.random.shuffle(shuffled_dirs)
 
@@ -480,42 +491,58 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
     xml_files = []
 
     for candidate_dir in shuffled_dirs:
+        #finds all dicom files within the subfolders
         cand_dcm = glob.glob(os.path.join(candidate_dir, '**', '*.dcm'), recursive=True)
         if not cand_dcm:
             continue
-
+        #once all dicom files are found within the sub folder, we group them together by their SeriesInstanceUID
         cand_series = defaultdict(list)
         for fp in cand_dcm:
             try:
+                #this is fairly important for optimization as it ensures we only look at the metadata 
+                # rather then loading the entire image each time
                 h = pydicom.dcmread(fp, stop_before_pixels=True)
+                #this makes sure that we only keep 3d ct slices(filters out everything else like 2d chest x-rays and etc)
                 if getattr(h, 'Modality', '') == 'CT' and hasattr(h, 'ImagePositionPatient'):
                     cand_series[h.SeriesInstanceUID].append(fp)
             except Exception:
                 continue
 
         if cand_series:
+            #if multiple candidates exist within the CT series(a scan with 2 slices vs one with 100), we return the largest one)
             best_series = max(cand_series.values(), key=len)
-            if len(best_series) > 10:
+            if len(best_series) > 10: # we require 10 slices to make a stackable ct scan(number could be modified to your liking)
                 folder = candidate_dir
                 series_files = best_series
+                # we look for the related xml file(IMPORTANT)
                 xml_files = glob.glob(os.path.join(candidate_dir, '**', '*.xml'), recursive=True)
                 break
 
     if folder is None or not series_files:
         raise RuntimeError(f"Checked {len(patient_dirs)} folders in {root_dir}, but none contained a valid 3D CT scan.")
-
+    
+    #console logging
     patient_id = os.path.basename(folder)
     print(f"Selected Patient: {patient_id}")
 
+
+    #-------------------------------------------------------------------------------
+    # 3D SLICING PLANE HELPER, WINDOW/LEVEL PRESETS, CENTRAL STATE VARIABLES
+    #-------------------------------------------------------------------------------
+    
+    # extracts the 3d numpy array into a 2d plane depending on the plane given(a,s,c)
+    # we return True to call .flip, to ensure proper orientation when displaying ct scans
     def get_slice():
         x, y, z = state['cursor']
         if state['plane'] == 'axial':    return vol[z, :, :], True    # flip: row 0 = anterior -> top
         if state['plane'] == 'coronal':  return vol[:, y, :], True   # row 0 = inferior -> bottom
         return vol[:, :, x], True                                    # sagittal
 
+    # returns number of slices across the x,y,z plane(this is used to prevent the user from scrolling out of bounds)
     def plane_count():
         return {'axial': Z, 'coronal': Y, 'sagittal': X}[state['plane']]
-
+    
+    #presets for optimal window/level values when trying to enhance certain features of the CT scan
     PRESETS = [
         ('Lung',        1600, -600),
         ('Mediastinum',  500,   50),
@@ -527,6 +554,9 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
         ('Stroke',        30,   30),
     ]
 
+    #IMPORTANT
+    # This is the central dictionary used when keeping track of important parameters throghout the program
+    # Any important features should be added here to keep readibility.
     state = {
         'patient_id': patient_id,
         'plane' : 'axial',
@@ -545,9 +575,9 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
         'show_truth': False,
         'trial_result' : None,
     }
-
+    #used to prevent crashing as python cant handle a float call on multiple variables
+    # henceforth, we return the first values as a float if possible.
     def to_float(v, default):
-        """Return a float from a number, a list of numbers, or fall back to default."""
         if v is None:
             return float(default)
         try:
@@ -557,46 +587,73 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
         except (TypeError, ValueError, IndexError):
             return float(default)
 
+
+
+    #-------------------------------------------------------------------------------
+    # CONSTRUCTING 3D NUMPY ARRAY, XML ANNOTATION, DISTANCE CALCULATOR
+    #-------------------------------------------------------------------------------
+    
     def build_volume(paths):
+        #loads full dicom dataset
         dss = [pydicom.dcmread(p) for p in paths]
+        #sort the slices using the z coordinate, from bottom to top
         dss.sort(key=lambda d: float(d.ImagePositionPatient[2]))
+        #stacks 2d slices into 3d array and converst values into Hounsfield Units(HU)
         vol = np.stack([d.pixel_array.astype(np.float32) * float(d.get('RescaleSlope', 1))
                         + float(d.get('RescaleIntercept', 0)) for d in dss])
         zs = np.array([float(d.ImagePositionPatient[2]) for d in dss])
+        #computes the physical z-spacing (mm between each slice)
         z_sp = float(np.median(np.abs(np.diff(zs)))) if len(zs) > 1 else float(dss[0].get('SliceThickness', 1))
+        #we extract the milimeter spacing
         row_sp, col_sp = [float(v) for v in dss[0].PixelSpacing]
         origin = np.array(dss[0].ImagePositionPatient, dtype=float)
+        #we create the lookup table to map each slice's UID, to its associated annotated XML file
         sop_to_z = {str(d.SOPInstanceUID).strip(): idx for idx, d in enumerate(dss)}
+        
         return vol, dict(x=col_sp, y=row_sp, z=z_sp), origin, dss[0], sop_to_z
-
+    
+    # we now build the 3d volume and unpack the 3 dimensions
     vol, spacing, origin, ds0, sop_to_z = build_volume(series_files)
     Z, Y, X = vol.shape
+    
+    #initialize state with volume metadata and center cursor at the origin
     state['ds'] = ds0
     state['sop_to_z'] = sop_to_z
     state['cursor'] = [X // 2, Y // 2, Z // 2]
+    
+    #set to monochrome so apply_window() can properly correct it
     state['invert'] = ds0.get('PhotometricInterpretation', '') == 'MONOCHROME1'
+    
+    #we set the default parameters based off dicom file metedata
     state['default_center'] = to_float(ds0.get('WindowCenter'), (vol.min() + vol.max()) / 2)
     state['default_width'] = max(1.0, to_float(ds0.get('WindowWidth'), vol.max() - vol.min()))
     state['center'], state['width'] = state['default_center'], state['default_width']
 
     AXIS = {'axial': 2, 'coronal': 1, 'sagittal': 0}
 
-# ---- STAGE 1B: XML GROUND-TRUTH NODULE PARSER (WITH DIAGNOSTICS & <3MM SUPPORT) ----
-    # If no XML is inside the patient folder, check if there is a global XML folder in root_dir
+
+    #-------------------------------------------------------------------------------
+    # CONNECTING THE DICOM FILES WITH ITS ASSOCIATED XML FILE
+    #-------------------------------------------------------------------------------
+    
+    # Same as root_dir but this is for the xml files. Make sure to match xml_dir with the proper filepath to the xml folder
     xml_dir = r'C:\Users\asosa02\Downloads\lidc_idri\tcia-lidc-xml'
 
+    # If the patient's DICOM folder did not contain a .xml file, search the external XML archive
     if not xml_files:
         search_roots = [xml_dir, root_dir]
         all_root_xmls = []
         for s_root in search_roots:
             if os.path.exists(s_root):
                 all_root_xmls.extend(glob.glob(os.path.join(s_root, '**', '*.xml'), recursive=True))
-
+        
+        #extract the UID from the ct scan to guarantee we find the right XML file
         target_series_uid = str(ds0.SeriesInstanceUID).strip()
         sample_sop = next(iter(state['sop_to_z'].keys()), '')
 
         for xp in all_root_xmls:
             try:
+                #optimization: we first check the plain-text substring before fully parsing the xml file
                 with open(xp, 'r', encoding='utf-8', errors='ignore') as f:
                     content = f.read()
                     if target_series_uid in content or (sample_sop and sample_sop in content):
@@ -607,7 +664,13 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
 
     print(f"Found {len(xml_files)} XML annotation file(s) for {patient_id}: {xml_files}")
 
+    #-------------------------------------------------------------------------------
+    #  LIDC PARSER
+    #-------------------------------------------------------------------------------
+    
     def parse_lidc_xml(xml_paths, sop_map):
+        # parses LIDC-IDRI XML annotatrion files using ElementTree
+        # we extract both the large and small nodules and map their 3d indices(x,y,z)
         nodules = []
         for xml_path in xml_paths:
             try:
@@ -617,27 +680,32 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
                 print(f"Could not parse XML {xml_path}: {e}")
                 continue
 
-            # Helper to strip XML namespaces from tag names
+            # Helper to strip XML namespaces from tag names(gets rid of {http://www.nih.gov}roi' -> 'roi' and etc)
             def local_tag(elem):
                 return elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
 
-            # Find all readingSession elements regardless of namespace
+            # Find all readingSession elements(each one conatins up to 4 annotations)
             sessions = [el for el in root.iter() if local_tag(el) == 'readingSession']
 
             for session_idx, session in enumerate(sessions):
-                # Find all unblindedReadNodule blocks inside this session
+                # Extracts the true nodule annotations
                 nod_elements = [el for el in session if local_tag(el) == 'unblindedReadNodule']
 
                 for nod in nod_elements:
+                    #grabs the radiologist's label for the nodule
+                    #IMPORTANT
+                    #we coulld use this if you want to specify the exact type of nodule
                     nod_id = 'Unknown'
                     for child in nod:
                         if local_tag(child) == 'noduleID' and child.text:
                             nod_id = child.text.strip()
-
+                    
+                    #collects and maps 3d points
                     slices_dict = defaultdict(list)
                     all_x, all_y, all_z = [], [], []
                     nod_type = 'nodule_>=3mm'
 
+                    #since a nodule can span multiple slices, we store them as a block in roi
                     rois = [el for el in nod if local_tag(el) == 'roi']
                     for roi in rois:
                         sop_uid = None
@@ -647,8 +715,10 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
                                 break
                         if not sop_uid or sop_uid not in sop_map:
                             continue
+                        #convert the SOPInstanceUID to its sorted z index
                         z_idx = sop_map[sop_uid]
-
+                        
+                        #extract the 2d pixel coordinates for this slice
                         coords = []
                         for child in roi:
                             t = local_tag(child)
@@ -669,15 +739,16 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
 
                         if coords:
                             slices_dict[z_idx].extend(coords)
-
+                    
+                    #store the 3d box for this nodule
                     if all_x:
-                        # Pad bounding box by 5 pixels for <3mm single-point locus nodules
+                        # expanding each small nodule by 5 pixels so it creates a valid square region
                         pad = 5 if nod_type == 'nodule_<3mm' else 0
                         nodules.append({
                             'type': nod_type,
                             'reader': session_idx + 1,
                             'id': nod_id,
-                            'bbox': {
+                            'bbox': { #3d bounding box for nodule to ensure a proper hit evaluation
                                 'x_min': min(all_x) - pad, 'x_max': max(all_x) + pad,
                                 'y_min': min(all_y) - pad, 'y_max': max(all_y) + pad,
                                 'z_min': min(all_z),       'z_max': max(all_z),
@@ -686,10 +757,16 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
                         })
         return nodules
 
+    #console logging
     state['nodules'] = parse_lidc_xml(xml_files, state['sop_to_z'])
     nodule_z_slices = sorted({z for n in state['nodules'] for z in n['slices'].keys()})
     print(f"Found {len(series_files)} CT slices for {patient_id}")
     print(f"Found {len(state['nodules'])} radiologist nodule annotations across Z-slices (1-based): {[z + 1 for z in nodule_z_slices]}")
+    
+    #-------------------------------------------------------------------------------
+    # Window Loader, Level/Window Logic, 3d anatomical converter
+    #-------------------------------------------------------------------------------
+    
     
     def fit_display(shape):
         rows, cols = shape
@@ -697,27 +774,31 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
                   'coronal': (spacing['z'], spacing['x']),
                   'sagittal': (spacing['z'], spacing['y'])}[state['plane']]
         h_mm, w_mm = rows * sy, cols * sx
-        #caqluclations to ensure that we are within the window's boundaries
+        #calculations to ensure that we are within the window's boundaries
         base_scale = min(win.size[0] * 0.8 / w_mm, win.size[1] * 0.9 / h_mm)
         
-        #uses the user's zom level to update the current window zoom
+        #uses the user's zoom level to update the current window zoom
         final_scale = base_scale * state['zoom']
         
         dicom_display.units = 'pix'
         dicom_display.size = (w_mm * final_scale, h_mm * final_scale)
         dicom_display.pos = (state['pan'][0], state['pan'][1])
-        
+    
+    #applies window/level contrast to the current HU
     def apply_window():
         img, flip = get_slice()
         low, high = state['center'] - state['width'] / 2, state['center'] + state['width'] / 2
+        #normalize Hu values from 0.0 to 1.0
         img = (np.clip(img, low, high) - low) / (high - low)
         if state['invert']:
             img = 1.0 - img
+        #we rescale values from -1.0 to 1.0 to properly display image in psychopy
         img = img * 2 - 1
         dicom_display.image = np.flipud(img) if flip else img
         fit_display(img.shape)
         update_text()
-
+    
+    #updates the top left box(slice counter and gtuess coordinates)
     def update_text():
         ax = AXIS[state['plane']]
         displayInfo.units = 'pix'
@@ -730,6 +811,8 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
             base_txt += f"\nGuess: Voxel ({gx}, {gy}, Slice {gz + 1})"
         displayInfo.text = base_txt
 
+    # Converts the mouse position into coordinates(2d) and then maps them into 3d indices
+    # as well as the physical position(mm).
     def screen_to_voxel(mouse):
         x_m, y_m = mouse.getPos()
         px, py = convertToPix(np.array([0, 0]), np.array([x_m, y_m]), win.units, win)
@@ -737,10 +820,10 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
         cx, cy = dicom_display.pos
         u, v = (px - cx) / w + 0.5, (py - cy) / h + 0.5
         if not (0 <= u < 1 and 0 <= v < 1):
-            return None, None
+            return None, None #return none if outside the image
         x, y, z = state['cursor']
         plane = state['plane']
-        if plane == 'axial':
+        if plane == 'axial': 
             x, y = u * X, (1.0 - v) * Y
         elif plane == 'coronal':
             x, z = u * X, v * Z
@@ -750,11 +833,8 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
         mm = origin + vox * np.array([spacing['x'], spacing['y'], spacing['z']])
         return vox, mm
     
+    #transforms the 3d array into a viewable 2d screen
     def voxel_to_screen(vx, vy, vz):
-        """
-        Projects any 3D voxel (vx, vy, vz) onto the active 2D plane ('axial', 'coronal', 'sagittal').
-        Returns (px, py) if the voxel lies on the currently viewed slice, else None.
-        """
         cx_vox, cy_vox, cz_vox = state['cursor']
         plane = state['plane']
 
@@ -780,7 +860,7 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
         py = (v - 0.5) * h + cy
         return px, py
         
-    # Visual stimuli for the user's guess marker (cyan ring + crosshair center)
+    # Visual representation of where the user places their guess
     guess_ring = visual.Circle(
         win, radius=12, edges=32, units='pix',
         fillColor=None, lineColor=[0.5, 0, 1.0], lineWidth=2.5
@@ -789,14 +869,19 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
         win, radius=2.5, edges=16, units='pix',
         fillColor=[0.5, 0, 1.0], lineColor=[0.5, 0, 1.0]
     )
-    # Visual stimulus for ground-truth debug bounding boxes (press 't' to toggle)
+    # Mostly for debugging purposes, but pressing t highlights where the nodules are
     truth_rect = visual.Rect(
         win, width=10, height=10, units='pix',
         fillColor=None, lineColor=[0.5, 0, 1.0], lineWidth=1.5
     )
+    
+    #-------------------------------------------------------------------------------
+    # Draw guess marker, annotated nodules and switching contrast presets
+    #-------------------------------------------------------------------------------
+    
 
     def draw_overlays():
-        # 1. Draw user's Shift + Left-Click guess marker on whichever plane intersects it
+        # Draw's the current user guess onto the inte4rsecting plane
         if state['current_guess'] is not None:
             gx, gy, gz = state['current_guess']
             scr_pos = voxel_to_screen(gx, gy, gz)
@@ -807,7 +892,7 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
                 guess_ring.draw()
                 guess_dot.draw()
 
-        # 2. Draw ground-truth XML nodule boxes across Axial, Coronal, AND Sagittal planes
+        #drawing the overlays onto the nodules(press t to show)
         if state['show_truth']:
             cx_vox, cy_vox, cz_vox = state['cursor']
             plane = state['plane']
@@ -847,7 +932,7 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
                     truth_rect.pos = ((p1[0] + p2[0]) / 2.0, (p1[1] + p2[1]) / 2.0)
                     truth_rect.draw()
         
-        
+    #updates Window/Level to a preset or the dicom file preset, and refreshes the window
     def apply_preset(name):
         if name is None:
             state['width'] = state['default_width']
@@ -861,12 +946,17 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
                     break
         apply_window()
 
-# ---- on-screen buttons (drawn in pixel units, right edge of window) ----
-    # ---- STAGE 3A: PRESET & ACTION BUTTONS (RIGHT PANEL) ----
+
+    #-------------------------------------------------------------------------------
+    # Contrast Buttons, decision buttons, nouse click detection
+    #-------------------------------------------------------------------------------
+    
+    #sets the buttons dimensions
     BTN_W, BTN_H, BTN_GAP = 160, 34, 8
     btn_x = win.size[0] / 2 - BTN_W / 2 - 15
     btn_y0 = win.size[1] / 2 - 40
 
+    #building preset contrast buttons
     entries = [(f"{i + 1}  {n}", n, 'preset') for i, (n, w, l) in enumerate(PRESETS)]
     entries.append(("0  File default", None, 'preset'))
 
@@ -879,12 +969,13 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
                               units='pix', color='white')
         buttons.append({'name': name, 'type': btype, 'pos': pos, 'rect': rect, 'txt': txt})
 
-    # Place Action Buttons below the presets with an extra visual gap
+    # Build the guess buttons
     action_y0 = btn_y0 - len(entries) * (BTN_H + BTN_GAP) - 24
     action_entries = [
         ("Confirm Guess", "confirm_guess"),
         ("No Nodule", "no_nodule"),
     ]
+    
     for j, (label, action_name) in enumerate(action_entries):
         pos = (btn_x, action_y0 - j * (BTN_H + BTN_GAP + 4))
         rect = visual.Rect(win, width=BTN_W, height=BTN_H + 4, pos=pos, units='pix',
@@ -893,7 +984,7 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
                               units='pix', color='white', bold=True)
         buttons.append({'name': action_name, 'type': 'action', 'pos': pos, 'rect': rect, 'txt': txt})
 
-    # keyboard: 1-8 = presets, 0 = file default (top row or numpad)
+    #mapping number keys to preset buttons(so we can use the keyboard to change presets rather then mouse)
     key_to_preset = {}
     for i, (n, w, l) in enumerate(PRESETS):
         key_to_preset[str(i + 1)] = n
@@ -901,8 +992,8 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
     key_to_preset['0'] = None
     key_to_preset['num_0'] = None
 
+    #returns if the mouse clicked was a button
     def button_at(mouse):
-        """Return the button dict under the mouse, or None."""
         x, y = mouse.getPos()
         px, py = convertToPix(np.array([0, 0]), np.array([x, y]), win.units, win)
         for b in buttons:
@@ -912,6 +1003,7 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
                 return b
         return None
 
+    #renders and colors all buttons on the top right of the screen
     def draw_buttons():
         for b in buttons:
             if b['type'] == 'preset':
@@ -933,7 +1025,11 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
             b['rect'].draw()
             b['txt'].draw()
 
-    # Spatial hit evaluation
+    #-------------------------------------------------------------------------------
+    # Nodule Guess Decision maker, milimeter distance error difference
+    #-------------------------------------------------------------------------------
+    
+    #compares the user's guess against the annotated xml file
     def evaluate_trial_decision(decision_type, rt_sec):
         """
         Evaluates user's 'confirm_guess' or 'no_nodule' submission against
@@ -942,7 +1038,9 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
         """
         has_nodules = len(state['nodules']) > 0
         guess = state['current_guess']
-
+        
+        #IMPORTANT
+        #this is our results from the trial, very useful when moving onto the csv data exportation phase
         result = {
             'patient_id': state['patient_id'],
             'decision': decision_type,
@@ -961,25 +1059,26 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
             result['outcome'] = 'True Negative' if not has_nodules else 'False Negative (Miss)'
             return result
 
-        # If user confirmed a location guess:
+        # If user confirmed a nodule location
         gx, gy, gz = guess
         matched_ids = []
         min_dist_mm = float('inf')
-
-        # Tolerance margin: 5 voxels in X/Y and 1 slice in Z to account for edge clicks
+        
+        #IMPORTANT 
+        # Toleracnce margin for nodule guess, change as deemed best fit by researchers
         xy_tol = 5
         z_tol = 1
 
         for nod in state['nodules']:
             bb = nod['bbox']
-            # 1. Check if guess falls inside this radiologist's 3D bounding box (+ tolerance)
+            # check to see if guess  falls within the "nodule box"
             in_x = (bb['x_min'] - xy_tol) <= gx <= (bb['x_max'] + xy_tol)
             in_y = (bb['y_min'] - xy_tol) <= gy <= (bb['y_max'] + xy_tol)
             in_z = (bb['z_min'] - z_tol)  <= gz <= (bb['z_max'] + z_tol)
             if in_x and in_y and in_z:
                 matched_ids.append(f"R{nod['reader']}:{nod['id']}")
 
-            # 2. Compute 3D physical distance (mm) from guess to nodule center
+            # Compute the distance from the nodule's center (mm)
             cx = 0.5 * (bb['x_min'] + bb['x_max'])
             cy = 0.5 * (bb['y_min'] + bb['y_max'])
             cz = 0.5 * (bb['z_min'] + bb['z_max'])
@@ -1002,20 +1101,34 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
             result['outcome'] = 'False Positive (Mislocalized)' if has_nodules else 'False Positive (No Nodule in Scan)'
 
         return result
+        
+        
+    #-------------------------------------------------------------------------------
+    # This is where the experiment actually runs(while lop for now, but will change)
+    #-------------------------------------------------------------------------------
+    
+    
+    
     
     kb = keyboard.Keyboard()
     mouse = Mouse(visible = True, win = win)
     
+    #keyboard shorcuts to view different aqnatomical planes of ct scan
     PLANE_KEYS = {'a': 'axial', 'c': 'coronal', 's': 'sagittal'}   # add this
 
-    experiment_time = 300
+    # we end the program once timer passes 5 minutes
+    # this logic has to be changed so the program ends once the experiment is actuallkly over.
+    experiment_time = 300 
     
+    #render the initial slice before starting
     apply_window()
     
+    #resets mouse movements
     mouse.getWheelRel()
     mouse.getRel()
     timer = core.Clock()
     
+    #numerical values for controling zoom/drag sensitivity, change as researchers seem best fit.
     drag_sensitivity = 0.5 * (vol.max() - vol.min())
     zoom_sensitivity = 1
     
@@ -1024,10 +1137,10 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
     zoom_drag_active = False
     wl_drag_active = False
     
-    #this is the logic behind the scroll wheel functionality. As the project develops, this will become a function and it'll allow the user to
-    # easily scroll whenever they want, rather then it being for the duration of experiment_time
+    # program runs while there is time left, or esc is pressed.
     while timer.getTime() < experiment_time:
         key_names = [k.name for k in kb.getKeys()]
+        #terminates program if esc is pressed
         if 'escape' in key_names:
             break
         if 'r' in key_names:
@@ -1103,7 +1216,7 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
                             print(f"  {k}: {v}")
                         break                               # End current trial routine
                 elif shift_held:
-                    # SHIFT + LEFT-CLICK: Record 3D voxel guess and sync 3D cursor
+                    # logic behind user placing a nodule guess
                     vox, mm = screen_to_voxel(mouse)
                     if vox is not None:
                         state['current_guess'] = [int(vox[0]), int(vox[1]), int(vox[2])]
@@ -1118,7 +1231,6 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
 
             if zoom_drag_active and dy != 0:
                 # Adjust zoom level (dragging up zooms in, down zooms out)
-                # Clamped between 0.1x (tiny) and 10.0x (huge)
                 state['zoom'] = max(0.1, min(state['zoom'] + dy * zoom_sensitivity, 10.0))
                 apply_window()
 
