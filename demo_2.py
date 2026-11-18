@@ -19,14 +19,15 @@ Version 1.5
 Description: This script was created for the HFAN Research Laboratory. It currently allows the user to see dicom files,
 change the anatomical plane, zoom, window position, and window/level of the filer. The next version will allow ther user to properly guess,
 where they believe the nodule is located.
-
 """
 
 # --- Import packages ---
+import pylink
+from EyeLinkCoreGraphicsPsychoPy import EyeLinkCoreGraphicsPsychoPy
 import csv
 import json
-import random
 import xml.etree.ElementTree as ET
+import re
 from collections import defaultdict
 from psychopy.tools.monitorunittools import convertToPix
 from psychopy import locale_setup
@@ -57,6 +58,13 @@ from psychopy import visual
 from psychopy import core
 from psychopy.hardware import keyboard
 from psychopy.event import Mouse
+
+DUMMY_NODE = True
+
+if DUMMY_NODE:
+    tracker = pylink.EyeLink(None)
+else:
+    tracker = pylink.EyeLink("100.1.1.1")
 
 # --- Setup global variables (available in all functions) ---
 # create a device manager to handle hardware (keyboards, mice, mirophones, speakers, etc.)
@@ -507,7 +515,7 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
         'mouse_left', 'mouse_middle', 'mouse_right', 'shift_held',
         'wheel_dy', 'scroll_reversal_on_frame', 'drag_mode',
         'guess_active', 'guess_vx', 'guess_vy', 'guess_vz',
-        'events'
+        'gaze_px_x', 'gaze_px_y', 'events'
     ]
 
     with open(trials_csv_path, mode='w', newline='', encoding='utf-8') as f_tr:
@@ -525,6 +533,47 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
             active_telemetry_buffer.clear()
 
     runAtExit.append(flush_telemetry_buffer)
+    
+    #-------------------------------------------------------------------------------
+    # EYELINK SETUP, CALIBRATION & EXIT CLEANUP
+    #-------------------------------------------------------------------------------
+    
+    
+    # Keep only letters, numbers, and underscores; cap at 8 chars; fallback to "test" if empty
+    clean_id = re.sub(r'[^A-Za-z0-9_]', '', str(expInfo['participant']))[:8] or "test"
+    edf_host_name = f"{clean_id}.edf"
+    edf_local_path = f"{filename}.edf"
+
+    tracker.openDataFile(edf_host_name)
+    tracker.sendCommand("sample_rate 1000")
+    tracker.sendCommand("file_event_filter = LEFT,RIGHT,FIXATION,SACCADE,BLINK,MESSAGE,BUTTON")
+    tracker.sendCommand("file_sample_data = LEFT,RIGHT,GAZE,AREA,GAZERES,STATUS")
+    tracker.sendCommand("link_event_filter = LEFT,RIGHT,FIXATION,SACCADE,BLINK,BUTTON")
+    tracker.sendCommand("link_sample_data = LEFT,RIGHT,GAZE,AREA,GAZERES,STATUS")
+
+    # Dynamically match whatever monitor resolution PsychoPy opened
+    scn_width, scn_height = int(win.size[0]), int(win.size[1])
+    tracker.sendCommand(f"screen_pixel_coords = 0 0 {scn_width - 1} {scn_height - 1}")
+    tracker.sendMessage(f"DISPLAY_COORDS 0 0 {scn_width - 1} {scn_height - 1}")
+
+    # Link PsychoPy window for calibration targets
+    genv = EyeLinkCoreGraphicsPsychoPy(tracker, win)
+    pylink.openGraphicsEx(genv)
+
+    if not DUMMY_NODE:
+        tracker.doTrackerSetup()
+    
+
+    def cleanup_eyelink():
+        if tracker.isConnected():
+            tracker.setOfflineMode()
+            pylink.pumpDelay(100)
+            tracker.closeDataFile()
+            if not DUMMY_NODE:
+                tracker.receiveDataFile(edf_host_name, edf_local_path)
+            tracker.close()
+
+    runAtExit.append(cleanup_eyelink)
     
 
     #-------------------------------------------------------------------------------
@@ -704,8 +753,8 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
         # CONNECTING THE DICOM FILES WITH ITS ASSOCIATED XML FILE
         #-------------------------------------------------------------------------------
         
-        # Same as root_dir but this is for the xml files. Make sure to match xml_dir with the proper filepath to the xml folder
-        xml_dir = r'C:\Users\asosa02\Downloads\lidc_idri\tcia-lidc-xml'
+        # grabs the xml directory
+        xml_dir = os.path.join(os.path.expanduser('~'), 'Downloads', 'lidc_idri', 'tcia-lidc-xml')
 
         # If the patient's DICOM folder did not contain a .xml file, search the external XML archive
         if not xml_files:
@@ -1335,6 +1384,7 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
             gx, gy, gz = guess
             plane = state['plane']
             matched_ids = []
+            min_dist_sq = float('inf')
             min_dist_mm = float('inf')
             closest_id = None
             closest_inplane_mm = None
@@ -1351,9 +1401,10 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
                 dx_mm = (gx - cx) * spacing['x']
                 dy_mm = (gy - cy) * spacing['y']
                 dz_mm = (gz - cz) * spacing['z']
-                dist_mm = float(np.sqrt(dx_mm**2 + dy_mm**2 + dz_mm**2))
-                if dist_mm < min_dist_mm:
-                    min_dist_mm = dist_mm
+                dist_sq = dx_mm**2 + dy_mm**2 + dz_mm**2
+                if dist_sq < min_dist_sq:
+                    min_dist_sq = dist_sq
+                    min_dist_mm = float(np.sqrt(dist_sq))
                     closest_id = nod['id']
                     closest_z_err = int(round(gz - cz))
                     if plane == 'axial':
@@ -1392,14 +1443,18 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
         mouse.getRel()
         timer = core.Clock()
         trial_start_global_sec = globalClock.getTime()
+        prev_mouse_x, prev_mouse_y = mouse.getPos()
 
-        drag_sensitivity = 0.5 * (vol.max() - vol.min())
-        zoom_sensitivity = 1
+        drag_sensitivity = 0.25 * (vol.max() - vol.min())
+        zoom_sensitivity = 0.25
         
         left_was_down = False
         right_was_down = False
         zoom_drag_active = False
         wl_drag_active = False
+        
+        x_m, y_m = mouse.getPos()
+        prev_m_px_x, prev_m_px_y = convertToPix(np.array([0, 0]), np.array([x_m, y_m]), win.units, win)
 
         # Per-trial search & oscillation accumulators
         frame_idx = 0
@@ -1447,16 +1502,27 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
         truth_overlay_time_sec = 0.0
 
         prev_logged_state = None
+        
+        # Start EyeLink recording for this trial
+        tracker.setOfflineMode()
+        tracker.sendMessage(f"TRIALID {trial_idx}")
+        tracker.sendMessage(f"!V TRIAL_VAR patient_id {state['patient_id']}")
+        tracker.startRecording(1, 1, 1, 1)
+        pylink.pumpDelay(100)  # Let tracker stabilize
+        tracker.sendMessage(f"SYNCTIME global_sec={globalClock.getTime():.5f}")
 
         #-------------------------------------------------------------------------------
         # INTERACTIVE WHILE LOOP
         #-------------------------------------------------------------------------------
+    
         while timer.getTime() < experiment_time:
             frame_events = []
             scroll_reversal_on_frame = False
             trial_ended_this_frame = False
 
-            key_names = [k.name for k in kb.getKeys()]
+            keys = kb.getKeys(clear=True)
+            key_names = [k.name for k in keys]
+            shift_held = any(k.name in ('lshift', 'rshift', 'shift') for k in keys)
             if 'escape' in key_names:
                 exit_reason = 'escape'
                 user_escaped_session = True
@@ -1519,21 +1585,27 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
             else:
                 wheel_x, wheel_y = 0.0, 0.0
 
-            dx, dy = mouse.getRel()
+            curr_mouse_x, curr_mouse_y = mouse.getPos()
             left_pressed, middle_pressed, right_pressed = mouse.getPressed()
             both_pressed = left_pressed and right_pressed
-            held_keys = [k.name for k in kb.getKeys(waitRelease=False, clear=False)]
-            shift_held = ('lshift' in held_keys) or ('rshift' in held_keys) or ('shift' in held_keys)
+            
+            # Track absolute mouse movement from click anchor
+            x_m, y_m = mouse.getPos()
+            m_px_x, m_px_y = convertToPix(np.array([0, 0]), np.array([x_m, y_m]), win.units, win)
 
             if not trial_ended_this_frame:
                 if both_pressed:
                     zoom_drag_active = False
                     wl_drag_active = False
-                    if dx != 0 or dy != 0:
-                        state['pan'][0] += dx * win.size[1]
-                        state['pan'][1] += dy * win.size[1]
+                    # Pan via absolute delta from previous frame
+                    dx_p = m_px_x - prev_m_px_x
+                    dy_p = m_px_y - prev_m_px_y
+                    if dx_p != 0 or dy_p != 0:
+                        state['pan'][0] += dx_p
+                        state['pan'][1] += dy_p
                         apply_window()
                 else:
+                    # LEFT CLICK / ZOOM DRAG
                     if left_pressed and not left_was_down:
                         hit = button_at(mouse)
                         if hit is not None:
@@ -1547,20 +1619,13 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
                                     exit_reason = 'confirm_guess'
                                     state['trial_result'] = evaluate_trial_decision('confirm_guess', timer.getTime())
                                     frame_events.append('SUBMIT:confirm_guess')
-                                    print("\n=== TRIAL SUBMITTED: CONFIRM GUESS ===")
-                                    for k, v in state['trial_result'].items():
-                                        print(f"  {k}: {v}")
                                     trial_ended_this_frame = True
                                 else:
                                     frame_events.append('CONFIRM_REJECTED_NO_GUESS')
-                                    print("Cannot confirm guess: Shift + Left-Click on the scan to place a guess first!")
                             elif hit['name'] == 'no_nodule':
                                 exit_reason = 'no_nodule'
                                 state['trial_result'] = evaluate_trial_decision('no_nodule', timer.getTime())
                                 frame_events.append('SUBMIT:no_nodule')
-                                print("\n=== TRIAL SUBMITTED: NO NODULE ===")
-                                for k, v in state['trial_result'].items():
-                                    print(f"  {k}: {v}")
                                 trial_ended_this_frame = True
                         elif shift_held:
                             vox, mm = screen_to_voxel(mouse)
@@ -1575,34 +1640,47 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
                                 time_of_final_guess_sec = round(t_now, 4)
                                 update_text()
                                 frame_events.append(f"GUESS_PLACED:{state['current_guess'][0]}_{state['current_guess'][1]}_{state['current_guess'][2]}")
-                                print(f"Placed guess at Voxel {state['current_guess']} (Axial:{vox[2]+1}, Coronal:{vox[1]+1}, Sagittal:{vox[0]+1})")
                             zoom_drag_active = False
                         else:
                             zoom_drag_active = True
+                            zoom_anchor_y = m_px_y
+                            zoom_start_val = state['zoom']
                     elif not left_pressed:
                         zoom_drag_active = False
 
-                    if zoom_drag_active and dy != 0:
-                        state['zoom'] = max(0.1, min(state['zoom'] + dy * zoom_sensitivity, 10.0))
+                    if zoom_drag_active:
+                        # Dragging UP increases zoom, DOWN decreases zoom smoothly
+                        drag_delta = m_px_y - zoom_anchor_y
+                        state['zoom'] = max(0.1, min(zoom_start_val + (drag_delta * 0.005 * zoom_sensitivity), 10.0))
                         apply_window()
 
+                    # RIGHT CLICK / WINDOW-LEVEL DRAG
                     if right_pressed and not right_was_down:
                         hit = button_at(mouse)
                         if hit is not None:
                             wl_drag_active = False
                         else:
                             wl_drag_active = True
+                            wl_anchor_x = m_px_x
+                            wl_anchor_y = m_px_y
+                            wl_start_w = state['width']
+                            wl_start_c = state['center']
                     elif not right_pressed:
                         wl_drag_active = False
 
-                    if wl_drag_active and (dx != 0 or dy != 0):
-                        state['width'] = max(1.0, state['width'] + dx * drag_sensitivity)
-                        state['center'] += dy * drag_sensitivity
+                    if wl_drag_active:
+                        dx_wl = m_px_x - wl_anchor_x
+                        dy_wl = m_px_y - wl_anchor_y
+                        # Uses your drag_sensitivity variable (0.5 * HU range)
+                        state['width'] = max(1.0, wl_start_w + dx_wl * (drag_sensitivity * 0.002))
+                        state['center'] = wl_start_c + dy_wl * (drag_sensitivity * 0.002)
                         state['preset'] = 'Custom'
                         apply_window()
 
+            prev_m_px_x, prev_m_px_y = m_px_x, m_px_y
             left_was_down = left_pressed
             right_was_down = right_pressed
+
 
             # Render frame
             dicom_display.draw()
@@ -1610,6 +1688,18 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
             displayInfo.draw()
             draw_buttons()
             win.flip()
+            
+            # Push this frame's events to EyeLink EDF
+            if frame_events:
+                tracker.sendMessage(f"FRAME_{frame_idx} " + "|".join(frame_events))
+                
+            gaze_x, gaze_y = None, None
+            sample = tracker.getNewestSample()
+            if sample is not None:
+                if sample.isRightSample():
+                    gaze_x, gaze_y = sample.getRightEye().getGaze()
+                elif sample.isLeftSample():
+                    gaze_x, gaze_y = sample.getLeftEye().getGaze()
 
             #---------------------------------------------------------------------------
             # PER-FRAME IN-MEMORY TELEMETRY & ACCUMULATOR UPDATE (ZERO DISK I/O)
@@ -1708,7 +1798,7 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
                     mouse_over_nod, "|".join(hovered_nods),
                     int(left_pressed), int(middle_pressed), int(right_pressed), int(shift_held),
                     wheel_y, scroll_reversal_on_frame, drag_mode,
-                    g_active, g_vx, g_vy, g_vz,
+                    g_active, g_vx, g_vy, g_vz, gaze_x, gaze_y,
                     "|".join(frame_events)
                 ])
                 prev_logged_state = curr_state_signature
@@ -1724,6 +1814,10 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
         trial_end_global_sec = globalClock.getTime()
         if state['trial_result'] is None:
             state['trial_result'] = evaluate_trial_decision('none', timer.getTime())
+            
+        # Stop EyeLink recording for this trial
+        tracker.stopRecording()
+        tracker.sendMessage("TRIAL_RESULT 0")
 
         # Serialize ground-truth consensus nodules for the trial summary CSV
         gt_nodules_summary = []
