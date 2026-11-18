@@ -1,9 +1,13 @@
 # HFAN-Psychopy-Experimental-Software
-Psychopy based experimental software and data analysis scripts for HFAN, allowing for the tracking of eye movements and logging data during radiologist CT nodule detection trials.
+PsychoPy-based experimental software and data analysis scripts for HFAN, allowing for the tracking of eye movements and logging data during radiologist CT nodule detection trials.
+
+# Plugins Needed
+  - Numpy
+  - PsychoPy EyeLink 
 
 
 # PERSONAL NOTES
-This READ.ME is still a work in progress but it will become more fully fleshed out as the program comes to life. feel free to change anything about the description or how the repository will be properly displayed(so everything before "PERSONAL NOTES")
+This READ.ME is still a work in progress, but it will become more fully fleshed out as the program comes to life. Feel free to change anything about the description or how the repository will be properly displayed(so everything before "PERSONAL NOTES")
 
 In order to run the file, you must download it and run it specifically within "Coder View".
 
@@ -14,12 +18,12 @@ If there are any questions, just send me a message on Discord(server name is and
 
 Now I will begin to keep a checklist of things that need to be fully implemented:
 
-  1) Displaying the dicom images(COMPLETED)
+  1) Displaying the DICOM images(COMPLETED)
   2) Allowing the user to scroll through the images with the scroll wheel(COMPLETED)
   3) Allowing the user to change the window and level of each DICOM image(COMPLETED)
   4) Allow the user to change the anatomical plane of the DICOM file(COMPLETED)
-  5) Allow the user to zoom in/out of the image(WORK IN PROGRESS)
-  6) Allow the user to guess where they think the nodule is located
+  5) Allow the user to zoom in/out of the image(COMPLETED)
+  6) Allow the user to guess where they think the nodule is located(COMPLETED)
   7) Sync all of the data from all previous steps with the eye tracker
   8) Feed this back to HFAN in a presentable way so they can do their research work
 
