@@ -2,6 +2,7 @@
 PsychoPy-based experimental software and data analysis scripts for HFAN, allowing for the tracking of eye movements and logging data during radiologist CT nodule detection trials.
 
 # Plugins Needed
+  - Pydicom
   - Numpy
   - PsychoPy EyeLink 
 
