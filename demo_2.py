@@ -548,18 +548,32 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
     tracker.sendCommand("link_event_filter = LEFT,RIGHT,FIXATION,SACCADE,BLINK,BUTTON")
     tracker.sendCommand("link_sample_data = LEFT,RIGHT,GAZE,AREA,GAZERES,STATUS")
 
+    # Put tracker in offline mode and configure 9-point calibration
+    tracker.setOfflineMode()
+    tracker.sendCommand("calibration_type = HV9")
+
     # Dynamically match whatever monitor resolution PsychoPy opened
     scn_width, scn_height = int(win.size[0]), int(win.size[1])
     tracker.sendCommand(f"screen_pixel_coords = 0 0 {scn_width - 1} {scn_height - 1}")
     tracker.sendMessage(f"DISPLAY_COORDS 0 0 {scn_width - 1} {scn_height - 1}")
 
-    # Link PsychoPy window for calibration targets
+    # EyeLinkCoreGraphicsPsychoPy requires pixel units and defaults to black targets;
+    # temporarily switch to 'pix' and draw white targets on the black background
+    prev_units = win.units
+    win.units = 'pix'
+
     genv = EyeLinkCoreGraphicsPsychoPy(tracker, win)
+    genv.setCalibrationColors((1, 1, 1), (-1, -1, -1))  # white targets, black background (rgb)
+    genv.setTargetType('circle')
+    genv.setTargetSize(24)
     pylink.openGraphicsEx(genv)
 
     if not DUMMY_NODE:
         tracker.doTrackerSetup()
-    
+
+    # Restore original window units for the CT viewer and clear calibration screen
+    win.units = prev_units
+    win.flip()
 
     def cleanup_eyelink():
         if tracker.isConnected():
