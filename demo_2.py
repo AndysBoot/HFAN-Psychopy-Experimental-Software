@@ -28,6 +28,7 @@ import csv
 import json
 import xml.etree.ElementTree as ET
 import re
+from pyglet.window import key as pyglet_key
 from collections import defaultdict
 from psychopy.tools.monitorunittools import convertToPix
 from psychopy import locale_setup
@@ -51,12 +52,8 @@ import sys  # to get file system encoding
 from psychopy.hardware import keyboard
 
 # Run 'Before Experiment' code from code
-import os
 import glob
 import pydicom
-from psychopy import visual
-from psychopy import core
-from psychopy.hardware import keyboard
 from psychopy.event import Mouse
 
 DUMMY_NODE = True
@@ -574,8 +571,13 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
             tracker.close()
 
     runAtExit.append(cleanup_eyelink)
-    
 
+    # Session-wide input devices (created once before the trial loop)
+    kb = keyboard.Keyboard()
+    mouse = Mouse(visible=True, win=win)
+    key_state = pyglet_key.KeyStateHandler()
+    win.winHandle.push_handlers(key_state)
+    
     #-------------------------------------------------------------------------------
     # RANDOM PATIENT SELECTOR AND DICOM VALIDATOR
     #-------------------------------------------------------------------------------
@@ -952,7 +954,6 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
                 distinct_readers = {m['reader'] for m in members}
                 if len(distinct_readers) < min_readers:
                     continue
-
                 voxel_votes = defaultdict(int)
                 for m in members:
                     # Count at most 1 vote per reader per voxel
@@ -1429,27 +1430,20 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
                 result['outcome'] = 'False Positive (Mislocalized)' if has_nodules else 'False Positive (No Nodule in Scan)'
 
             return result
-
         #-------------------------------------------------------------------------------
         # TRIAL INITIALIZATION & TELEMETRY TRACKERS
         #-------------------------------------------------------------------------------
-        kb = keyboard.Keyboard()
-        mouse = Mouse(visible=True, win=win)
         PLANE_KEYS = {'a': 'axial', 'c': 'coronal', 's': 'sagittal'}
+        WATCHED_KEYS = ['escape', 'r', 't'] + list(PLANE_KEYS.keys()) + list(key_to_preset.keys())
         experiment_time = 600
 
         apply_window()
-        mouse.getWheelRel()
-        mouse.getRel()
         timer = core.Clock()
         trial_start_global_sec = globalClock.getTime()
-        prev_mouse_x, prev_mouse_y = mouse.getPos()
 
         drag_sensitivity = 0.25 * (vol.max() - vol.min())
         zoom_sensitivity = 0.25
         
-        left_was_down = False
-        right_was_down = False
         zoom_drag_active = False
         wl_drag_active = False
         
@@ -1511,6 +1505,12 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
         pylink.pumpDelay(100)  # Let tracker stabilize
         tracker.sendMessage(f"SYNCTIME global_sec={globalClock.getTime():.5f}")
 
+        # Flush any keys, scroll deltas, or held buttons from the previous trial / EyeLink delay
+        kb.clearEvents()
+        key_state.clear()
+        mouse.getWheelRel()
+        left_was_down, _, right_was_down = mouse.getPressed()
+
         #-------------------------------------------------------------------------------
         # INTERACTIVE WHILE LOOP
         #-------------------------------------------------------------------------------
@@ -1520,9 +1520,9 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
             scroll_reversal_on_frame = False
             trial_ended_this_frame = False
 
-            keys = kb.getKeys(clear=True)
+            keys = kb.getKeys(keyList=WATCHED_KEYS, waitRelease=False, clear=True)
             key_names = [k.name for k in keys]
-            shift_held = any(k.name in ('lshift', 'rshift', 'shift') for k in keys)
+            shift_held = bool(key_state[pyglet_key.LSHIFT] or key_state[pyglet_key.RSHIFT])
             if 'escape' in key_names:
                 exit_reason = 'escape'
                 user_escaped_session = True
@@ -1585,7 +1585,6 @@ def run(expInfo, thisExp, win, globalClock=None, thisSession=None):
             else:
                 wheel_x, wheel_y = 0.0, 0.0
 
-            curr_mouse_x, curr_mouse_y = mouse.getPos()
             left_pressed, middle_pressed, right_pressed = mouse.getPressed()
             both_pressed = left_pressed and right_pressed
             
